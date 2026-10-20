@@ -1,5 +1,5 @@
 use anyhow::Result;
-use chrono::Local;
+use chrono::{DateTime, FixedOffset, Local, Utc};
 use log::info;
 use reqwest::Client;
 use serde_json::{json, Value};
@@ -8,6 +8,18 @@ use crate::config::Config;
 pub struct Mattermost<'a> {
     pub http: &'a Client,
     pub config: &'a Config,
+}
+
+// Mattermost keeps expired custom statuses in props; the zero time means "never expires".
+fn custom_status_expiry(status: &Value) -> Option<DateTime<FixedOffset>> {
+    status["expires_at"]
+        .as_str()
+        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+        .filter(|t| t.timestamp() > 0)
+}
+
+pub fn is_custom_status_expired(status: &Value, now: DateTime<Utc>) -> bool {
+    custom_status_expiry(status).is_some_and(|t| t < now)
 }
 
 impl<'a> Mattermost<'a> {
@@ -48,7 +60,9 @@ impl<'a> Mattermost<'a> {
         if let Some(status_str) = res["props"]["customStatus"].as_str() {
             if !status_str.is_empty() {
                 if let Ok(parsed) = serde_json::from_str::<Value>(status_str) {
-                    state = parsed;
+                    if !is_custom_status_expired(&parsed, Utc::now()) {
+                        state = parsed;
+                    }
                 }
             }
         }
@@ -68,8 +82,9 @@ impl<'a> Mattermost<'a> {
     }
 
     pub async fn update_status_and_avail(&self, status_json: Value, availability: &str) -> Result<()> {
-        let text = status_json["text"].as_str().unwrap_or("").trim();
-        let emoji = status_json["emoji"].as_str().unwrap_or("").trim();
+        let expired = is_custom_status_expired(&status_json, Utc::now());
+        let text = if expired { "" } else { status_json["text"].as_str().unwrap_or("").trim() };
+        let emoji = if expired { "" } else { status_json["emoji"].as_str().unwrap_or("").trim() };
 
         let status_endpoint = format!("{}/api/v4/users/{}/status/custom", self.config.url, self.config.user_id);
         if text.is_empty() && emoji.is_empty() {
@@ -78,7 +93,15 @@ impl<'a> Mattermost<'a> {
                 .send()
                 .await?;
         } else {
-            let payload = json!({ "emoji": emoji, "text": text });
+            let mut payload = json!({ "emoji": emoji, "text": text });
+            // The server rejects a duration without a future expiry, so only forward both together.
+            if custom_status_expiry(&status_json).is_some() {
+                for key in ["duration", "expires_at"] {
+                    if let Some(v) = status_json.get(key) {
+                        payload[key] = v.clone();
+                    }
+                }
+            }
             self.http.put(&status_endpoint)
                 .header("Authorization", format!("Bearer {}", self.config.token))
                 .json(&payload)
@@ -97,5 +120,38 @@ impl<'a> Mattermost<'a> {
         let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
         info!("[{}] API Updated: Status -> '{}', Emoji: '{}', Avail -> '{}'", timestamp, text, emoji, availability);
         Ok(())
+    }
+}
+
+// ==========================================
+//                 TESTS
+// ==========================================
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn now() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-10-20T12:00:00Z").unwrap().with_timezone(&Utc)
+    }
+
+    #[test]
+    fn test_custom_status_expired_in_past() {
+        let status = json!({"text": "Out for lunch", "expires_at": "2026-10-20T10:00:00Z"});
+        assert!(is_custom_status_expired(&status, now()));
+    }
+
+    #[test]
+    fn test_custom_status_not_expired_in_future() {
+        let status = json!({"text": "Out for lunch", "expires_at": "2026-10-20T13:00:00Z"});
+        assert!(!is_custom_status_expired(&status, now()));
+    }
+
+    #[test]
+    fn test_custom_status_never_expires() {
+        // Zero time and missing field both mean "don't clear".
+        let zero = json!({"text": "Focusing", "expires_at": "0001-01-01T00:00:00Z"});
+        let missing = json!({"text": "Focusing"});
+        assert!(!is_custom_status_expired(&zero, now()));
+        assert!(!is_custom_status_expired(&missing, now()));
     }
 }
